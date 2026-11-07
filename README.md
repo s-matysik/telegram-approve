@@ -144,6 +144,7 @@ network. See `tests/conftest.py` for a fake transport. The test suite covers eve
 - Use private chats. In a group, any member could see the draft; only allowed ids can decide.
 - Messages are sent as plain text (no markup parsing), so draft content cannot inject formatting.
 - Payloads and drafts are stored in the database in clear text. Protect the file.
+- The content hash covers the `payload`, not the `body` shown in Telegram. The body is only a description, and it is cut to 3500 characters before sending, so the approver may not see all of it. Make the payload exactly what you will execute (the full email, the exact command, the exact diff), and render the body from that payload, never from separate data.
 
 ## Limitations
 

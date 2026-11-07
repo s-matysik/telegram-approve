@@ -284,3 +284,77 @@ async def test_sqlite_persists_across_instances(tmp_path, transport):
     assert a2.get("act1").state is State.APPROVED
     assert await a2.execute("act1", PAYLOAD, lambda p: 1) == 1
     s2.close()
+
+
+async def test_revise_failed_send_keeps_old_in_revise(store, transport):
+    ap_ = Approver(None, [ALLOWED], store, transport=transport)
+    old = await ask(ap_)
+    real_send = transport.send
+
+    async def broken_send(*a, **kw):
+        raise ConnectionError("telegram down")
+
+    transport.send = broken_send
+    with pytest.raises(ConnectionError):
+        await ap_.revise(old, Draft("v2", "b", {**PAYLOAD, "body": "v2"}), by="u")
+    assert old.state is State.REVISE and old.successor is None
+    assert store.get("act1").superseded_by is None
+    # a stray press on the old buttons cannot approve it any more
+    await ap_.handle_callback(ALLOWED, transport.data("approve", 0), callback_id="c")
+    assert ap_.get("act1").state is State.REVISE
+    # once sending works again the revision goes through and supersedes the old one
+    transport.send = real_send
+    new = await ap_.revise(old, Draft("v2", "b", {**PAYLOAD, "body": "v2"}), by="u")
+    assert old.state is State.SUPERSEDED and old.successor is new
+    assert old.record.superseded_by == new.action_id and new.state is State.PENDING
+
+
+async def test_handle_text_survives_on_edit_error(store, transport):
+    def on_edit(approval, notes):
+        raise RuntimeError("model crashed")
+
+    ap_ = Approver(None, [ALLOWED], store, transport=transport, on_edit=on_edit)
+    ap = await ask(ap_)
+    await ap_.handle_callback(ALLOWED, transport.data("edit"), callback_id="c", chat_id=ALLOWED)
+    await ap_.handle_text(ALLOWED, "fix it", chat_id=ALLOWED)  # must not raise
+    assert ap_.get(ap.action_id).state is State.PENDING
+    assert transport.replies[-1] == (ALLOWED, "Could not apply your corrections for act1.")
+
+
+async def test_handle_text_survives_parallel_decision(store, transport):
+    ap_holder = {}
+
+    async def on_edit(approval, notes):
+        # someone approves while the new draft is being prepared
+        approve = transport.data("approve", 0)
+        await ap_holder["ap"].handle_callback(ALLOWED, approve, callback_id="x")
+        return Draft("v2", "b", {**PAYLOAD, "body": notes})
+
+    ap_ = Approver(None, [ALLOWED], store, transport=transport, on_edit=on_edit)
+    ap_holder["ap"] = ap_
+    await ask(ap_)
+    await ap_.handle_callback(ALLOWED, transport.data("edit"), callback_id="c", chat_id=ALLOWED)
+    await ap_.handle_text(ALLOWED, "fix it", chat_id=ALLOWED)  # must not raise
+    assert ap_.get("act1").state is State.APPROVED
+    assert len(transport.sent) == 1
+    assert transport.replies[-1] == (ALLOWED, "act1 was already decided.")
+
+
+async def test_stop_without_start_is_noop(store):
+    class StrictTransport:
+        def bind(self, approver):
+            pass
+
+        async def start(self):
+            self.running = True
+
+        async def stop(self):
+            if not getattr(self, "running", False):
+                raise RuntimeError("stop() before start()")
+            self.running = False
+
+    ap_ = Approver(None, [ALLOWED], store, transport=StrictTransport())
+    await ap_.stop()
+    await ap_.start()
+    await ap_.stop()
+    await ap_.stop()

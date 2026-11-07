@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from .models import (
 )
 from .store import Store
 from .transport import Attachment, Transport
+
+log = logging.getLogger(__name__)
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,40}$")
 _MAX_TEXT = 3500
@@ -124,12 +127,18 @@ class Approver:
         self.transport.bind(self)
         self._live: dict[str, Approval] = {}
         self._awaiting_edit: dict[int, str] = {}
+        self._started = False
 
     # lifecycle -------------------------------------------------------------
     async def start(self) -> None:
         await self.transport.start()
+        self._started = True
 
     async def stop(self) -> None:
+        """Stop the transport. A no-op if `start()` was never called (or already stopped)."""
+        if not self._started:
+            return
+        self._started = False
         await self.transport.stop()
 
     async def __aenter__(self) -> Approver:
@@ -184,24 +193,46 @@ class Approver:
         return approval
 
     async def revise(self, old: Approval, draft: Draft, by: str | None = None) -> Approval:
-        """Supersede `old` with a new request for the edited draft (new hash, new approval)."""
+        """Supersede `old` with a new request for the edited draft (new hash, new approval).
+
+        `old` must be pending or already in 'revise'. It is first claimed as 'revise' (so
+        no parallel decision can land on it) and becomes 'superseded' only after the new
+        request was sent successfully. If sending fails, `old` stays in 'revise', the
+        unsent new request is expired, and the error is raised.
+        """
+        current = self.store.get(old.action_id)
+        if current is None:
+            raise UnknownAction(old.action_id)
+        if current.state == State.PENDING.value:
+            ok = self.store.transition(
+                old.action_id, [State.PENDING.value], State.REVISE.value,
+                decided_by=by, decided_at=now_iso(),
+            )  # fmt: skip
+            if not ok:
+                raise NotApproved(f"{old.action_id} is no longer pending")
+        elif current.state != State.REVISE.value:
+            raise NotApproved(f"{old.action_id} is '{current.state}', not pending")
         new_id = _next_revision_id(old.action_id)
-        ok = self.store.transition(
-            old.action_id,
-            [State.PENDING.value],
-            State.SUPERSEDED.value,
-            superseded_by=new_id,
-            decided_by=by,
-            decided_at=now_iso(),
+        while self.store.get(new_id) is not None:  # skip ids left by failed sends
+            new_id = _next_revision_id(new_id)
+        try:
+            new = await self.request(
+                new_id, draft.title, draft.body, draft.payload, draft.attachments,
+                _supersedes=old.action_id, on_decision=old._on_decision,
+            )  # fmt: skip
+        except Exception:
+            if self.store.get(new_id) is not None:
+                self.store.transition(
+                    new_id, [State.PENDING.value], State.EXPIRED.value,
+                    decided_by="system:send_failed", decided_at=now_iso(),
+                )  # fmt: skip
+            await self._finish(old, "edit requested, the revised draft could not be sent")
+            raise
+        self.store.transition(
+            old.action_id, [State.REVISE.value], State.SUPERSEDED.value, superseded_by=new_id
         )
-        if not ok:
-            raise NotApproved(f"{old.action_id} is no longer pending")
-        await self._finish(old, "superseded by a new draft")
-        new = await self.request(
-            new_id, draft.title, draft.body, draft.payload, draft.attachments,
-            _supersedes=old.action_id, on_decision=old._on_decision,
-        )  # fmt: skip
         old.successor = new
+        await self._finish(old, "superseded by a new draft")
         return new
 
     def get(self, action_id: str) -> Approval:
@@ -346,10 +377,25 @@ class Approver:
             if ok:
                 await self._finish(self.get(action_id), "edit requested")
             return
-        draft = self.on_edit(approval, text)
-        if inspect.isawaitable(draft):
-            draft = await draft
-        await self.revise(approval, draft, by=who)
+        try:
+            draft = self.on_edit(approval, text)
+            if inspect.isawaitable(draft):
+                draft = await draft
+            await self.revise(approval, draft, by=who)
+        except NotApproved:
+            log.info("corrections for %s dropped: decided in parallel", action_id)
+            await self._safe_reply(chat_id, user_id, f"{action_id} was already decided.")
+        except Exception:  # noqa: BLE001 - never let a handler error escape into the bot
+            log.exception("applying corrections for %s failed", action_id)
+            await self._safe_reply(
+                chat_id, user_id, f"Could not apply your corrections for {action_id}."
+            )
+
+    async def _safe_reply(self, chat_id: int | None, user_id: int, text: str) -> None:
+        try:
+            await self.transport.reply(chat_id if chat_id is not None else int(user_id), text)
+        except Exception:  # noqa: BLE001 - best effort notice
+            log.exception("could not send a reply to %s", user_id)
 
     # internals -------------------------------------------------------------
     def _expire_record(self, action_id: str) -> bool:
